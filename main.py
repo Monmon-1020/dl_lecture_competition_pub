@@ -1,72 +1,14 @@
-import re
-import random
-import time
+import torch
+from torch.utils.data import Dataset
+from transformers import BertTokenizer
+from PIL import Image
+import pandas as pd
+from collections import Counter
 from statistics import mode
 
-from PIL import Image
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-import torchvision
-from torchvision import transforms
-from nltk.corpus import stopwords
-
-
-# データフレームの読み込み
-train_df = pd.read_json('./data/train.json')
-val_df = pd.read_json('./data/valid.json')
-
-# クラスマッピングの読み込み
-class_mapping = pd.read_csv('https://huggingface.co/spaces/CVPR/VizWiz-CLIP-VQA/raw/main/data/annotations/class_mapping.csv')
-class_mapping_dict = dict(zip(class_mapping['answer'].astype(str), class_mapping['class_id']))
-
-# 質問文の前処理
-nltk.download('stopwords')
-stop_words = set(stopwords.words('english'))
-
-def process_text(question):
-    question = question.lower()  # 小文字に変換
-    question = re.sub(r'[^\w\s]', '', question)  # 句読点を削除
-    question = ' '.join([word for word in question.split() if word not in stop_words])  # ストップワードの削除
-    return question
-
-
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-from transformers import BertTokenizer
-
-
-# 2. 評価指標の実装
-# 簡単にするならBCEを利用する
-def VQA_criterion(batch_pred: torch.Tensor, batch_answers: torch.Tensor):
-    total_acc = 0.
-
-    for pred, answers in zip(batch_pred, batch_answers):
-        acc = 0.
-        for i in range(len(answers)):
-            num_match = 0
-            for j in range(len(answers)):
-                if i == j:
-                    continue
-                if pred == answers[j]:
-                    num_match += 1
-            acc += min(num_match / 3, 1)
-        total_acc += acc / 10
-
-    return total_acc / len(batch_pred)
-
-
-
-
+def process_text(text):
+    # テキストの前処理を行う関数（例：小文字化、不要な記号の削除など）
+    return text.lower()
 
 class VQADataset(Dataset):
     def __init__(self, df_path, image_dir, transform=None, answer=True):
@@ -118,26 +60,30 @@ class VQADataset(Dataset):
 
     def __len__(self):
         return len(self.df)
-    
+
 import torch
 import torch.nn as nn
+import torchvision.models as models
 from transformers import BertModel
 
 class VQAModel(nn.Module):
     def __init__(self, n_answer: int):
         super(VQAModel, self).__init__()
-        self.resnet = ResNet18()
+        vgg16 = models.vgg16(pretrained=True)
+        self.vgg16 = nn.Sequential(*list(vgg16.features.children()), nn.Flatten())
+        self.vgg16_output_dim = 25088  # VGG16の出力特徴量の次元数
+
         self.bert = BertModel.from_pretrained('bert-base-uncased')
         self.lstm = nn.LSTM(768, 512, batch_first=True, bidirectional=True)
 
         self.fc = nn.Sequential(
-            nn.Linear(512 * 2 + 512, 512),
+            nn.Linear(self.vgg16_output_dim + 512 * 2, 512),
             nn.ReLU(inplace=True),
             nn.Linear(512, n_answer)
         )
 
     def forward(self, image, input_ids, attention_mask):
-        image_feature = self.resnet(image)  # 画像の特徴量
+        image_feature = self.vgg16(image)  # 画像の特徴量
         bert_output = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         question_feature, _ = self.lstm(bert_output.last_hidden_state)  # BERTの出力をLSTMに入力
         question_feature = question_feature[:, -1, :]  # 最後のLSTMの出力を使用
@@ -162,7 +108,7 @@ train_transform = transforms.Compose([
 ])
 
 train_dataset = VQADataset(df_path='./data/train.json', image_dir='./train', transform=train_transform)
-train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
 
 # モデル、損失関数、オプティマイザの準備
 model = VQAModel(n_answer=len(train_dataset.answer2idx)).to(device)
@@ -170,7 +116,7 @@ criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
 # 訓練ループ
-num_epoch = 5
+num_epoch = 15
 for epoch in range(num_epoch):
     model.train()
     total_loss = 0
@@ -185,7 +131,7 @@ for epoch in range(num_epoch):
         loss = criterion(output, mode_answer_idx)
         loss.backward()
 
-        if (i + 1) % 4 == 0:  # accumulation_steps = 4
+        if (i + 1) % 2 == 0:  # accumulation_steps = 4
             optimizer.step()
             optimizer.zero_grad()
 
@@ -193,6 +139,8 @@ for epoch in range(num_epoch):
         _, predicted = torch.max(output, 1)
         correct += (predicted == mode_answer_idx).sum().item()
         total += mode_answer_idx.size(0)
+        if (i%500==0):
+            print(i,'/',len(train_loader))
 
     end_time = time.time()
     train_loss = total_loss / total
@@ -203,23 +151,24 @@ for epoch in range(num_epoch):
           f"train time: {train_time:.2f} [s]\n"
           f"train loss: {train_loss:.4f}\n"
           f"train acc: {train_acc:.4f}")
-
-
-test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./valid", transform=transform, answer=False)
-test_dataset.update_dict(train_dataset)
-
-test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
-
+    
 # 提出用ファイルの作成
 model.eval()
 submission = []
-for image, question in test_loader:
-    image, question = image.to(device), question.to(device)
-    pred = model(image, question)
-    pred = pred.argmax(1).cpu().item()
-    submission.append(pred)
+for image, input_ids, attention_mask in test_loader:
+    image = image.to(device)
+    input_ids = input_ids.to(device)
+    attention_mask = attention_mask.to(device)
+    
+    with torch.no_grad():
+        pred = model(image, input_ids, attention_mask)
+        pred = pred.argmax(1).cpu().item()
+        submission.append(pred)
 
 submission = [train_dataset.idx2answer[id] for id in submission]
 submission = np.array(submission)
+
+# モデルの保存
 torch.save(model.state_dict(), "model.pth")
+# 提出ファイルの保存
 np.save("submission.npy", submission)
