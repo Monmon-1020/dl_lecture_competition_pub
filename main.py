@@ -71,6 +71,38 @@ class VQADataset(Dataset):
 
     def __len__(self):
         return len(self.df)
+    
+import torch
+import torch.nn as nn
+import torchvision.models as models
+from transformers import BertModel
+
+class VQAModel(nn.Module):
+    def __init__(self, n_answer: int):
+        super(VQAModel, self).__init__()
+        vgg16 = models.vgg16(pretrained=True)
+        self.vgg16 = nn.Sequential(*list(vgg16.features.children()), nn.Flatten())
+        self.vgg16_output_dim = 25088  # VGG16の出力特徴量の次元数
+
+        self.bert = BertModel.from_pretrained('bert-base-uncased')
+        self.lstm = nn.LSTM(768, 512, batch_first=True, bidirectional=True)
+
+        self.fc = nn.Sequential(
+            nn.Linear(self.vgg16_output_dim + 512 * 2, 512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, n_answer)
+        )
+
+    def forward(self, image, input_ids, attention_mask):
+        image_feature = self.vgg16(image)  # 画像の特徴量
+        bert_output = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        question_feature, _ = self.lstm(bert_output.last_hidden_state)  # BERTの出力をLSTMに入力
+        question_feature = question_feature[:, -1, :]  # 最後のLSTMの出力を使用
+
+        x = torch.cat([image_feature, question_feature], dim=1)
+        x = self.fc(x)
+
+        return x
 
 import torch
 import torch.optim as optim
