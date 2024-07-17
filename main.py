@@ -5,10 +5,21 @@ from PIL import Image
 import pandas as pd
 from collections import Counter
 from statistics import mode
+import nltk
+from nltk.corpus import stopwords
+nltk.download('stopwords')
+stop_words = set(stopwords.words('english'))
 
 def process_text(text):
-    # テキストの前処理を行う関数（例：小文字化、不要な記号の削除など）
-    return text.lower()
+    # 句読点の削除
+    text = text.translate(str.maketrans('', '', string.punctuation))
+
+    # 単語に分割
+    words = text.split()
+
+    # ストップワードの削除
+    filtered_words = [word for word in words if word not in stop_words]
+    return ' '.join(filtered_words)
 
 class VQADataset(Dataset):
     def __init__(self, df_path, image_dir, transform=None, answer=True):
@@ -62,42 +73,11 @@ class VQADataset(Dataset):
         return len(self.df)
 
 import torch
-import torch.nn as nn
-import torchvision.models as models
-from transformers import BertModel
-
-class VQAModel(nn.Module):
-    def __init__(self, n_answer: int):
-        super(VQAModel, self).__init__()
-        vgg16 = models.vgg16(pretrained=True)
-        self.vgg16 = nn.Sequential(*list(vgg16.features.children()), nn.Flatten())
-        self.vgg16_output_dim = 25088  # VGG16の出力特徴量の次元数
-
-        self.bert = BertModel.from_pretrained('bert-base-uncased')
-        self.lstm = nn.LSTM(768, 512, batch_first=True, bidirectional=True)
-
-        self.fc = nn.Sequential(
-            nn.Linear(self.vgg16_output_dim + 512 * 2, 512),
-            nn.ReLU(inplace=True),
-            nn.Linear(512, n_answer)
-        )
-
-    def forward(self, image, input_ids, attention_mask):
-        image_feature = self.vgg16(image)  # 画像の特徴量
-        bert_output = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        question_feature, _ = self.lstm(bert_output.last_hidden_state)  # BERTの出力をLSTMに入力
-        question_feature = question_feature[:, -1, :]  # 最後のLSTMの出力を使用
-
-        x = torch.cat([image_feature, question_feature], dim=1)
-        x = self.fc(x)
-
-        return x
-
-import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
 import time
+import numpy as np
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -116,7 +96,7 @@ criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
 # 訓練ループ
-num_epoch = 15
+num_epoch = 11
 for epoch in range(num_epoch):
     model.train()
     total_loss = 0
@@ -152,7 +132,19 @@ for epoch in range(num_epoch):
           f"train loss: {train_loss:.4f}\n"
           f"train acc: {train_acc:.4f}")
     
-# 提出用ファイルの作成
+# テストデータのロード
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./valid", transform=transform, answer=False)
+
+# 訓練データを使用して辞書を更新する
+test_dataset.update_dict(train_dataset)
+
+test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+
 model.eval()
 submission = []
 for image, input_ids, attention_mask in test_loader:
